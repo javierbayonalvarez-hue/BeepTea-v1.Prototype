@@ -1,0 +1,137 @@
+BUSCATEA DIGITAL - BOM / LISTA DE COMPRA
+Version: MVP hardware
+Fecha: 2026-05-05
+
+OBJETIVO
+Dispositivo tipo busca/pager para rutinas visuales con pictogramas, vibracion, sonido, RTC y botones fisicos.
+
+
+1. ELECTRONICA PRINCIPAL
+
+[ ] 1x LILYGO T-Display-S3 ESP32-S3
+    - Pantalla 1.9" ST7789, 170 x 320.
+    - 16 MB Flash, 8 MB PSRAM.
+    - Conector bateria JST-GH 1.25 mm 2P.
+    - Mejor version sin touch para evitar distracciones.
+
+[ ] 1x Bateria LiPo 3.7 V 1200 mAh modelo 103450
+    - Preferible con circuito de proteccion integrado.
+    - Conector compatible JST-GH 1.25 mm 2P o adaptador.
+
+[ ] 1x Modulo RTC DS3231 Mini I2C
+    - Alimentacion a 3.3 V.
+    - Conexiones: VCC, GND, SDA, SCL.
+    - Revisar si trae circuito de carga para pila LIR2032 antes de usar CR2032/CR1220.
+
+[ ] 1x Pila para RTC
+    - CR1220, CR2032 o LIR2032 segun el modulo DS3231 comprado.
+    - No usar pila no recargable si el modulo intenta cargarla.
+
+
+2. FEEDBACK / ALERTAS
+
+[ ] 1x Modulo motor de vibracion tipo moneda con driver integrado
+    - Pines: IN, VCC, GND.
+    - Conexion recomendada:
+      IN  -> GPIO 1
+      VCC -> 3V3
+      GND -> GND
+    - Al usar este modulo NO hace falta comprar MOSFET, diodo ni resistencias para el motor.
+
+[ ] 1x Buzzer pasivo 3 V / piezo pasivo
+    - Conexion MVP:
+      positivo -> GPIO 2
+      negativo -> GND
+    - Si el buzzer elegido consume mucho, anadir transistor/MOSFET como driver.
+
+
+3. ENTRADA FISICA
+
+[ ] 0x Pulsadores externos para el MVP de pruebas
+    - De momento se usan los 2 botones integrados de la LILYGO T-Display-S3.
+    - Boton integrado GPIO 0 -> OK / confirmar.
+    - Boton integrado GPIO 14 -> Menu / Necesidades.
+    - No hace falta comprar botones externos para probar firmware y app.
+
+
+4. CARCASA Y MONTAJE
+
+[ ] 1x Carcasa impresa en PETG
+    - Formato tipo busca/pager.
+    - Huecos para pantalla, USB-C, botones y sonido.
+    - Espacio para bateria 103450 y cableado.
+
+[ ] 1x Clip metalico de cinturon
+    - Preferible metalico por resistencia.
+
+[ ] 1 lote tornillos M2 / M2.5
+    - Segun diseno de carcasa.
+
+[ ] 1 lote insertos termicos M2 / M2.5
+    - Recomendado si la carcasa se abre/cierra muchas veces.
+
+[ ] 1 pieza espuma EVA fina o almohadilla adhesiva
+    - Para sujetar bateria y evitar vibraciones internas.
+
+
+5. HERRAMIENTAS / CONSUMIBLES
+
+[ ] Cable USB-A a USB-C de datos
+    - Para programar el LILYGO.
+    - LILYGO recomienda cable USB 2.0 A-C.
+
+[ ] Estaño fino para electronica
+
+[ ] Flux
+
+[ ] Cinta Kapton o aislante fino
+
+[ ] Multimetro
+    - Para comprobar continuidad, polaridad de bateria y modulo DS3231.
+
+
+6. COMPONENTES QUE YA NO SON NECESARIOS SI USAS EL MODULO DE VIBRACION DE LA FOTO
+
+[ ] MOSFET canal N para motor
+[ ] Resistencia gate 100 ohm para motor
+[ ] Resistencia pulldown 100k para motor
+[ ] Diodo flyback para motor
+
+Nota: mantenerlos solo si se decide usar un motor suelto sin placa driver.
+
+
+7. PINOUT MVP
+
+Motor vibracion modulo:
+IN  -> GPIO 1
+VCC -> 3V3
+GND -> GND
+
+Buzzer pasivo:
++ -> GPIO 2
+- -> GND
+
+Boton OK:
+GPIO 0 -> boton integrado LILYGO
+
+Boton Menu:
+GPIO 14 -> boton integrado LILYGO
+
+RTC DS3231:
+VCC -> 3V3
+GND -> GND
+SDA -> GPIO 17
+SCL -> GPIO 18
+
+Bateria:
+LiPo 3.7 V -> JST-GH 1.25 mm 2P del LILYGO
+
+
+8. NOTAS DE SEGURIDAD
+
+- No alimentar el DS3231 a 5 V.
+- No usar CR2032/CR1220 si el modulo DS3231 intenta cargar la pila.
+- No conectar motor suelto directamente a GPIO. El modulo de vibracion con driver si puede ir por IN.
+- Todos los GND deben estar unidos.
+- Proteger fisicamente la bateria dentro de la carcasa.
+- Evitar piezas pequenas sueltas en un dispositivo infantil.

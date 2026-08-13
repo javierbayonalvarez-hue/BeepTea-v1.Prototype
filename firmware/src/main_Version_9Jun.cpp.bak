@@ -1,0 +1,1417 @@
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <ESPAsyncWebServer.h>
+#include <ESPmDNS.h>
+#include <LittleFS.h>
+#include <NimBLEDevice.h>
+#include <Preferences.h>
+#include <RTClib.h>
+#include <TFT_eSPI.h>
+#include <TJpg_Decoder.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <time.h>
+
+#include "config.h"
+
+struct RoutineItem {
+  String id;
+  String title;
+  uint16_t startMin;
+  uint16_t endMin;
+  bool completed;
+};
+
+static TFT_eSPI tft;
+static RTC_DS3231 rtc;
+static AsyncWebServer server(80);
+static Preferences prefs;
+static NimBLECharacteristic *bleStatus = nullptr;
+
+static bool bleConnected = false;
+static RoutineItem routine[24];
+static size_t routineCount = 0;
+static int activeIndex = -1;
+static bool rtcAvailable = false;
+static bool wifiConnected = false;
+static bool setupMode = false;
+static bool restartPending = false;
+static wl_status_t lastWifiStatus = WL_IDLE_STATUS;
+static String attemptedWifiSsid = "";
+static bool needsMenuOpen = false;
+static bool alertRunning = false;
+static uint32_t alertStartedAt = 0;
+static bool deviceVibration = true;
+static bool deviceSound = true;
+static uint32_t deviceAlertMs = 3000; // default to 3s (3000ms)
+static uint32_t lastDrawAt = 0;
+static uint32_t okPressedAt = 0;
+static uint32_t menuPressedAt = 0;
+static bool okWasDown = false;
+static bool menuWasDown = false;
+static uint32_t restartAt = 0;
+
+static uint32_t lastInteractionTime = 0;
+static bool screenIsAsleep = false;
+
+static void enableNetwork();
+static void disableNetwork();
+
+static bool previewMode = false;
+static uint32_t previewStartedAt = 0;
+static int previewIndex = -1;
+
+static String routineName = "Sin rutina";
+static bool infoMode = false;
+static uint32_t infoStartedAt = 0;
+static bool menuLongPressed = false;
+
+static int lastDrawnIndex = -2;
+static bool lastDrawnNeedsMenu = false;
+static uint16_t lastDrawnMinute = 9999;
+static bool lastDrawnCompleted = false;
+static uint8_t lastDrawnProgress = 255;
+static String lastDrawnIp = "";
+static int lastDrawnBattery = -1;
+
+static bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
+  if (y >= SCREEN_H) return false;
+  tft.pushImage(x, y, w, h, bitmap);
+  return true;
+}
+
+static uint16_t parseTimeToMinutes(const String &value) {
+  int sep = value.indexOf(':');
+  if (sep < 0) return 0;
+  int hh = value.substring(0, sep).toInt();
+  int mm = value.substring(sep + 1).toInt();
+  hh = constrain(hh, 0, 23);
+  mm = constrain(mm, 0, 59);
+  return hh * 60 + mm;
+}
+
+static String minutesToTime(uint16_t value) {
+  char buffer[6];
+  snprintf(buffer, sizeof(buffer), "%02u:%02u", value / 60, value % 60);
+  return String(buffer);
+}
+
+static int batteryPercent() {
+  uint32_t millivolts = analogReadMilliVolts(PIN_BATTERY_ADC) * 2;
+  int percent = map(millivolts, 3300, 4200, 0, 100);
+  return constrain(percent, 0, 100);
+}
+
+static String activeIp() {
+  if (wifiConnected) return WiFi.localIP().toString();
+  if (setupMode) return WiFi.softAPIP().toString();
+  return "0.0.0.0";
+}
+
+static String wifiModeName() {
+  if (wifiConnected) return "station";
+  if (setupMode) return "setup";
+  return "offline";
+}
+
+static String wifiStatusName(wl_status_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS: return "IDLE";
+    case WL_NO_SSID_AVAIL: return "NO_SSID";
+    case WL_SCAN_COMPLETED: return "SCAN_DONE";
+    case WL_CONNECTED: return "CONNECTED";
+    case WL_CONNECT_FAILED: return "CONNECT_FAILED";
+    case WL_CONNECTION_LOST: return "CONNECTION_LOST";
+    case WL_DISCONNECTED: return "DISCONNECTED";
+    default: return String(static_cast<int>(status));
+  }
+}
+
+static void updateBleStatus();
+static void drawScreen(bool force = false);
+
+static uint16_t currentMinuteOfDay() {
+  if (rtcAvailable) {
+    DateTime now = rtc.now();
+    return now.hour() * 60 + now.minute();
+  }
+
+  uint32_t seconds = millis() / 1000;
+  return (seconds / 60) % 1440;
+}
+
+static uint16_t currentToneFreq = 0;
+static void safeTone(uint16_t freq) {
+  if (currentToneFreq != freq) {
+    currentToneFreq = freq;
+    ledcWriteTone(0, freq);
+  }
+}
+
+static void buzz(uint16_t freq, uint16_t durationMs) {
+  safeTone(freq);
+  delay(durationMs);
+  safeTone(0);
+}
+
+static void startTransitionAlert() {
+  lastInteractionTime = millis();
+  if (screenIsAsleep) {
+    screenIsAsleep = false;
+    tft.writecommand(0x11); // ST7789_SLPOUT
+    delay(120);
+    digitalWrite(PIN_LCD_BACKLIGHT, HIGH);
+    drawScreen(true);
+  }
+
+  alertRunning = true;
+  alertStartedAt = millis();
+  if (deviceVibration) {
+    digitalWrite(PIN_VIBRATION, HIGH);
+  }
+  if (deviceSound) {
+    // Inicializamos el patrón no bloqueante en updateAlert
+    // Ya no bloqueamos la ejecución aquí
+  }
+}
+
+static void updateAlert() {
+  if (!alertRunning) return;
+  uint32_t elapsed = millis() - alertStartedAt;
+  
+    if (elapsed >= deviceAlertMs) {
+    digitalWrite(PIN_VIBRATION, LOW);
+    if (deviceSound) safeTone(0); // Apagar zumbador al terminar
+    alertRunning = false;
+    return;
+  }
+  
+  if (deviceSound) {
+    // Patrón "Busca" no bloqueante (4 pitidos rápidos y pausa larga)
+    uint32_t t = elapsed % 1600;
+    if (t < 600) {
+      uint32_t cycle = t % 150;
+      if (cycle < 100) safeTone(4000); // 4000 Hz suele ser la frecuencia de resonancia y suena mucho más alto
+      else safeTone(0);
+    } else {
+      safeTone(0);
+    }
+  }
+}
+
+static bool loadRoutine() {
+  routineCount = 0;
+  routineName = "Sin rutina";
+  File file = LittleFS.open(ROUTINE_PATH, "r");
+  if (!file) return false;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, file);
+  file.close();
+  if (err) return false;
+
+  routineName = doc["name"] | "Sin rutina";
+  deviceVibration = doc["vibration"] | true;
+  deviceSound = doc["sound"] | true;
+  int durationSec = doc["alertDuration"] | 3;
+  deviceAlertMs = durationSec * 1000;
+
+  JsonArray items = doc["items"].as<JsonArray>();
+  for (JsonObject item : items) {
+    if (routineCount >= 24) break;
+    routine[routineCount].id = item["id"] | "";
+    routine[routineCount].title = item["title"] | routine[routineCount].id;
+    routine[routineCount].startMin = parseTimeToMinutes(item["start"] | "00:00");
+    routine[routineCount].endMin = parseTimeToMinutes(item["end"] | "00:00");
+    routine[routineCount].completed = false;
+    routineCount++;
+  }
+  return routineCount > 0;
+}
+
+static int findActiveRoutineIndex(uint16_t minute) {
+  for (size_t i = 0; i < routineCount; i++) {
+    if (routine[i].startMin <= routine[i].endMin) {
+      if (minute >= routine[i].startMin && minute < routine[i].endMin) return i;
+    } else {
+      if (minute >= routine[i].startMin || minute < routine[i].endMin) return i;
+    }
+  }
+  return -1;
+}
+
+static uint8_t progressFor(const RoutineItem &item, uint16_t minute) {
+  int start = item.startMin;
+  int end = item.endMin;
+  int now = minute;
+
+  if (end <= start) end += 1440;
+  if (now < start) now += 1440;
+
+  int total = max(1, end - start);
+  int elapsed = constrain(now - start, 0, total);
+  return (elapsed * 100) / total;
+}
+
+static void drawBatteryIcon(int x, int y, int w, int h, int percent, bool charging) {
+  uint16_t color = tft.color565(16, 185, 129); // Green
+  if (charging) {
+    color = TFT_YELLOW;
+  } else if (percent < 20) {
+    color = tft.color565(239, 68, 68); // Red
+  } else if (percent < 50) {
+    color = tft.color565(249, 115, 22); // Orange
+  }
+  
+  tft.drawRect(x, y, w - 2, h, color);
+  tft.fillRect(x + w - 2, y + 2, 2, h - 4, color); // battery tip
+  
+  if (charging) {
+    // Fill completely when charging or draw a pattern
+    tft.fillRect(x + 2, y + 2, w - 6, h - 4, color);
+    // Draw a small black bolt inside the filled yellow battery
+    tft.drawLine(x + w/2 - 2, y + 2, x + w/2, y + h/2, TFT_BLACK);
+    tft.drawLine(x + w/2, y + h/2, x + w/2 - 2, y + h/2, TFT_BLACK);
+    tft.drawLine(x + w/2 - 2, y + h/2, x + w/2 + 2, y + h - 2, TFT_BLACK);
+  } else {
+    int fillW = ((w - 4) * percent) / 100;
+    if (fillW > 0) {
+      tft.fillRect(x + 2, y + 2, fillW, h - 4, color);
+    }
+  }
+}
+
+static void drawWifiIcon(int x, int y, int rssi, bool apMode, bool connected) {
+  if (!connected) {
+    if (apMode) {
+      tft.setTextDatum(ML_DATUM);
+      tft.setTextColor(tft.color565(249, 115, 22), TFT_BLACK);
+      tft.drawString("AP", x, y + 4, 1);
+    } else {
+      uint16_t gray = tft.color565(80, 80, 90);
+      tft.fillRect(x, y + 6, 2, 2, gray);
+      tft.fillRect(x + 4, y + 4, 2, 4, gray);
+      tft.fillRect(x + 8, y + 2, 2, 6, gray);
+      tft.fillRect(x + 12, y, 2, 8, gray);
+      tft.drawLine(x - 2, y, x + 14, y + 8, tft.color565(239, 68, 68));
+    }
+  } else {
+    int bars = 1;
+    if (rssi >= -55) bars = 4;
+    else if (rssi >= -70) bars = 3;
+    else if (rssi >= -85) bars = 2;
+    
+    uint16_t barColor = tft.color565(16, 185, 129); // Green
+    uint16_t inactiveColor = tft.color565(50, 50, 60);
+    
+    tft.fillRect(x, y + 6, 2, 2, (bars >= 1) ? barColor : inactiveColor);
+    tft.fillRect(x + 4, y + 4, 2, 4, (bars >= 2) ? barColor : inactiveColor);
+    tft.fillRect(x + 8, y + 2, 2, 6, (bars >= 3) ? barColor : inactiveColor);
+    tft.fillRect(x + 12, y, 2, 8, (bars >= 4) ? barColor : inactiveColor);
+  }
+}
+
+static void drawBleIcon(int x, int y, bool connected) {
+  uint16_t color = connected ? tft.color565(59, 130, 246) : tft.color565(80, 80, 90);
+  tft.drawLine(x + 3, y, x + 3, y + 8, color);
+  tft.drawLine(x + 3, y, x + 6, y + 2, color);
+  tft.drawLine(x + 6, y + 2, x + 3, y + 4, color);
+  tft.drawLine(x + 3, y + 4, x + 6, y + 6, color);
+  tft.drawLine(x + 6, y + 6, x + 3, y + 8, color);
+  tft.drawLine(x + 3, y + 2, x, y, color);
+  tft.drawLine(x + 3, y + 6, x, y + 8, color);
+}
+
+static void drawSoundIcon(int x, int y, bool enabled) {
+  uint16_t color = enabled ? tft.color565(186, 195, 210) : tft.color565(80, 80, 90);
+  tft.fillRect(x, y + 2, 3, 4, color);
+  tft.drawLine(x + 3, y + 2, x + 6, y, color);
+  tft.drawLine(x + 3, y + 5, x + 6, y + 7, color);
+  tft.fillRect(x + 6, y, 1, 8, color);
+  if (enabled) {
+    tft.drawPixel(x + 8, y + 2, color);
+    tft.drawPixel(x + 9, y + 3, color);
+    tft.drawPixel(x + 9, y + 4, color);
+    tft.drawPixel(x + 8, y + 5, color);
+  }
+}
+
+static void drawVibrationIcon(int x, int y, bool enabled) {
+  uint16_t color = enabled ? tft.color565(186, 195, 210) : tft.color565(80, 80, 90);
+  tft.drawRect(x + 2, y + 1, 6, 8, color);
+  if (enabled) {
+    tft.drawPixel(x, y + 2, color);
+    tft.drawPixel(x + 1, y + 3, color);
+    tft.drawPixel(x + 1, y + 5, color);
+    tft.drawPixel(x, y + 6, color);
+    tft.drawPixel(x + 9, y + 2, color);
+    tft.drawPixel(x + 8, y + 3, color);
+    tft.drawPixel(x + 8, y + 5, color);
+    tft.drawPixel(x + 9, y + 6, color);
+  }
+}
+
+static void drawRoundRectGradientH(int x, int y, int w, int h, int r, uint16_t colorStart, uint16_t colorEnd) {
+  uint8_t rS = (colorStart >> 11) & 0x1F;
+  uint8_t gS = (colorStart >> 5) & 0x3F;
+  uint8_t bS = colorStart & 0x1F;
+  
+  uint8_t rE = (colorEnd >> 11) & 0x1F;
+  uint8_t gE = (colorEnd >> 5) & 0x3F;
+  uint8_t bE = colorEnd & 0x1F;
+  
+  for (int i = 0; i < w; i++) {
+    float t = (float)i / (w - 1);
+    uint8_t rC = rS + t * (rE - rS);
+    uint8_t gC = gS + t * (gE - gS);
+    uint8_t bC = bS + t * (bE - bS);
+    uint16_t color = (rC << 11) | (gC << 5) | bC;
+    
+    int dy = 0;
+    if (i < r) {
+      int dx = r - i;
+      dy = sqrt(r * r - dx * dx);
+      tft.drawFastVLine(x + i, y + r - dy, 2 * dy + (h - 2 * r), color);
+    } else if (i >= w - r) {
+      int dx = i - (w - r);
+      dy = sqrt(r * r - dx * dx);
+      tft.drawFastVLine(x + i, y + r - dy, 2 * dy + (h - 2 * r), color);
+    } else {
+      tft.drawFastVLine(x + i, y, h, color);
+    }
+  }
+}
+
+static bool isCharging() {
+  uint32_t millivolts = analogReadMilliVolts(PIN_BATTERY_ADC) * 2;
+  return millivolts > 4250;
+}
+
+static void drawHeader(uint16_t minute) {
+  // Ultra-clean transparent header on pure black background
+  tft.fillRect(0, 0, SCREEN_W, 22, TFT_BLACK);
+  
+  // Thin premium separator line below the header
+  tft.drawFastHLine(0, 22, SCREEN_W, tft.color565(40, 40, 50));
+
+  // Left: Time (08:30) in font 2 for super-sleek status style
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(minutesToTime(minute), 10, 11, 2);
+
+  // Center: Device Name ("BuscaTEA") in font 2 in elegant slate blue
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(tft.color565(186, 195, 210), TFT_BLACK);
+  tft.drawString("BuscaTEA", 160, 11, 2);
+
+  // Right side status values
+  int bat = batteryPercent();
+  bool charging = isCharging();
+  
+  // Battery percentage text (or charging icon text)
+  tft.setTextDatum(MR_DATUM);
+  if (charging) {
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString("CHG", SCREEN_W - 28, 11, 2);
+  } else {
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(String(bat) + "%", SCREEN_W - 28, 11, 2);
+  }
+
+  // Draw the battery graphic
+  drawBatteryIcon(SCREEN_W - 24, 4, 20, 10, bat, charging);
+
+  // Draw WiFi Icon
+  int rssi = wifiConnected ? WiFi.RSSI() : -100;
+  drawWifiIcon(246, 7, rssi, setupMode, wifiConnected);
+
+  // Draw BLE Icon
+  drawBleIcon(230, 7, bleConnected);
+
+  // Draw Vibration Icon
+  drawVibrationIcon(210, 7, deviceVibration);
+
+  // Draw Sound Icon
+  drawSoundIcon(192, 7, deviceSound);
+}
+
+static void drawBorderProgress(int x, int y, int w, int h, int thickness, uint8_t progress, uint16_t activeColor, uint16_t inactiveColor) {
+  // First, draw the background inactive border
+  for (int t = 0; t < thickness; t++) {
+    tft.drawRoundRect(x - t, y - t, w + 2 * t, h + 2 * t, 19, inactiveColor); // Concentric radius of 19 (16 card + 3 gap)
+  }
+
+  // Draw active progress over the four borders
+  int topProgress = constrain(progress, 0, 25);
+  for (int t = 0; t < thickness; t++) {
+    int topW = (topProgress * (w + 2 * t)) / 25;
+    tft.drawFastHLine(x - t, y - t, topW, activeColor);
+  }
+
+  if (progress > 25) {
+    int rightProgress = constrain(progress - 25, 0, 25);
+    for (int t = 0; t < thickness; t++) {
+      int rightH = (rightProgress * (h + 2 * t)) / 25;
+      tft.drawFastVLine(x + w - 1 + t, y - t, rightH, activeColor);
+    }
+  }
+
+  if (progress > 50) {
+    int bottomProgress = constrain(progress - 50, 0, 25);
+    for (int t = 0; t < thickness; t++) {
+      int bottomW = (bottomProgress * (w + 2 * t)) / 25;
+      tft.drawFastHLine(x + w - 1 + t - bottomW, y + h - 1 + t, bottomW, activeColor);
+    }
+  }
+
+  if (progress > 75) {
+    int leftProgress = constrain(progress - 75, 0, 25);
+    for (int t = 0; t < thickness; t++) {
+      int leftH = (leftProgress * (h + 2 * t)) / 25;
+      tft.drawFastVLine(x - t, y + h - 1 + t - leftH, leftH, activeColor);
+    }
+  }
+}
+
+static int findNextRoutineIndex(uint16_t minute) {
+  if (routineCount == 0) return -1;
+  if (activeIndex >= 0 && (size_t)(activeIndex + 1) < routineCount) {
+    return activeIndex + 1;
+  }
+  for (size_t i = 0; i < routineCount; i++) {
+    if (routine[i].startMin > minute) {
+      return i;
+    }
+  }
+  return 0;
+}
+
+static bool drawPictogramImage(const RoutineItem &item, int picX, int picY, int picW, int picH) {
+  String jpgPath = "/pictos/" + item.id + ".jpg";
+  String jpegPath = "/pictos/" + item.id + ".jpeg";
+  String path = LittleFS.exists(jpgPath) ? jpgPath : jpegPath;
+  if (!LittleFS.exists(path)) return false;
+
+  tft.fillRoundRect(picX, picY, picW, picH, 16, TFT_WHITE); // Squircle rounded card with radius 16
+
+  uint16_t jpgW = 0;
+  uint16_t jpgH = 0;
+  TJpgDec.getFsJpgSize(&jpgW, &jpgH, path, LittleFS);
+  uint8_t scale = 1;
+  while ((jpgW / scale > (picW - 6) || jpgH / scale > (picH - 6)) && scale < 8) {
+    scale *= 2;
+  }
+  TJpgDec.setJpgScale(scale);
+
+  int16_t drawW = jpgW / scale;
+  int16_t drawH = jpgH / scale;
+  int16_t x = picX + max(0, (picW - drawW) / 2);
+  int16_t y = picY + max(0, (picH - drawH) / 2);
+  TJpgDec.drawFsJpg(x, y, path, LittleFS);
+  return true;
+}
+
+static void drawPictogramPlaceholder(const RoutineItem &item, int picX, int picY, int picW, int picH) {
+  tft.fillRoundRect(picX, picY, picW, picH, 16, TFT_WHITE); // Squircle rounded card with radius 16
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.drawString(item.id.substring(0, 10), picX + picW / 2, picY + picH / 2, 2);
+}
+
+static void drawRightPanel(const RoutineItem &item, uint16_t minute, int cx, uint16_t activeProgressColor) {
+  tft.fillRect(150, 23, 170, 147, tft.color565(11, 13, 19)); // Clear right panel area
+  
+  bool twoLines = tft.textWidth(item.title, 4) > 160;
+
+  // 1. Time Range
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(tft.color565(156, 163, 175), tft.color565(11, 13, 19));
+  String timeRange = minutesToTime(item.startMin) + " - " + minutesToTime(item.endMin);
+  tft.drawString(timeRange, cx, twoLines ? 34 : 40, 2);
+  
+  // 2. Title
+  tft.setTextColor(TFT_WHITE, tft.color565(11, 13, 19));
+  if (!twoLines) {
+    tft.drawString(item.title, cx, 66, 4);
+  } else {
+    int splitIdx = -1;
+    int minDiff = 999;
+    for (int i = 0; i < (int)item.title.length(); i++) {
+      if (item.title[i] == ' ') {
+        int diff = abs(i - (int)item.title.length() / 2);
+        if (diff < minDiff) {
+          minDiff = diff;
+          splitIdx = i;
+        }
+      }
+    }
+    if (splitIdx > 0) {
+      String l1 = item.title.substring(0, splitIdx);
+      String l2 = item.title.substring(splitIdx + 1);
+      tft.drawString(l1, cx, 54, 4);
+      tft.drawString(l2, cx, 77, 4);
+    } else {
+      tft.drawString(item.title, cx, 66, 4);
+    }
+  }
+  
+  // 3. Countdown Badge
+  int badgeY = twoLines ? 94 : 80;
+  int remainingMin = item.endMin - minute;
+  if (remainingMin < 0) remainingMin += 1440;
+  String remainingStr = "Quedan " + String(remainingMin) + " min";
+  tft.fillRoundRect(cx - 55, badgeY, 110, 18, 9, tft.color565(30, 41, 59));
+  tft.setTextColor(tft.color565(52, 211, 153), tft.color565(30, 41, 59));
+  tft.drawString(remainingStr, cx, badgeY + 9, 2);
+  
+  // 4. Action Area
+  int cy = twoLines ? 136 : 126;
+  if (item.completed) {
+    tft.fillCircle(cx, cy, 16, activeProgressColor);
+    for (int i = -1; i <= 1; i++) {
+      tft.drawLine(cx - 7, cy + i, cx - 2, cy + 5 + i, TFT_WHITE);
+      tft.drawLine(cx - 2, cy + 5 + i, cx + 7, cy - 5 + i, TFT_WHITE);
+      tft.drawLine(cx - 7 + i, cy, cx - 2 + i, cy + 5, TFT_WHITE);
+      tft.drawLine(cx - 2 + i, cy + 5, cx + 7 + i, cy - 5, TFT_WHITE);
+    }
+  } else {
+    int bx = cx - 55;
+    int by = twoLines ? 120 : 110;
+    int bw = 110;
+    int bh = 32;
+    drawRoundRectGradientH(bx, by, bw, bh, 16, tft.color565(249, 115, 22), tft.color565(239, 68, 68));
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("OK", cx, by + bh / 2, 2);
+  }
+}
+
+static void drawActiveScreen(uint16_t minute) {
+  const RoutineItem &item = routine[activeIndex];
+  uint8_t progress = progressFor(item, minute);
+
+  // Floating design: white card centered in a glowing border frame with 3px gap
+  constexpr int picX = 12;
+  constexpr int picY = 28;
+  constexpr int picW = 134;
+  constexpr int picH = 134;
+  
+  constexpr int gap = 3;
+  constexpr int borderX = picX - gap;
+  constexpr int borderY = picY - gap;
+  constexpr int borderW = picW + 2 * gap;
+  constexpr int borderH = picH + 2 * gap;
+  constexpr int picThickness = 3;
+
+  // Center column for the right-hand panel (320 - 150 = 170px remaining, center at 150 + 85 = 235)
+  constexpr int cx = 235;
+
+  uint16_t activeProgressColor = tft.color565(16, 185, 129); // Premium Emerald Green
+  uint16_t inactiveProgressColor = tft.color565(60, 60, 70); // Sleek Dark Gray
+
+  if (activeIndex != lastDrawnIndex || lastDrawnNeedsMenu) {
+    tft.fillScreen(tft.color565(11, 13, 19)); // Premium dark-mode background
+    drawHeader(minute);
+    if (!drawPictogramImage(item, picX, picY, picW, picH)) {
+      drawPictogramPlaceholder(item, picX, picY, picW, picH);
+    }
+
+    // Draw square perimeter progress bar around the pictogram with the floating gap
+    drawBorderProgress(borderX, borderY, borderW, borderH, picThickness, progress, activeProgressColor, inactiveProgressColor);
+    drawRightPanel(item, minute, cx, activeProgressColor);
+  } else {
+    if (minute != lastDrawnMinute || activeIp() != lastDrawnIp || batteryPercent() != lastDrawnBattery) {
+      drawHeader(minute);
+    }
+    if (progress != lastDrawnProgress) {
+      drawBorderProgress(borderX, borderY, borderW, borderH, picThickness, progress, activeProgressColor, inactiveProgressColor);
+    }
+    if (item.completed != lastDrawnCompleted || minute != lastDrawnMinute) {
+      drawRightPanel(item, minute, cx, activeProgressColor);
+    }
+  }
+
+  lastDrawnIndex = activeIndex;
+  lastDrawnMinute = minute;
+  lastDrawnCompleted = item.completed;
+  lastDrawnProgress = progress;
+  lastDrawnIp = activeIp();
+  lastDrawnBattery = batteryPercent();
+}
+
+
+
+static void drawInfoScreen(uint16_t minute) {
+  tft.fillScreen(TFT_BLACK);
+  
+  // Header with thin separator
+  tft.fillRect(0, 0, SCREEN_W, 22, TFT_BLACK);
+  tft.drawFastHLine(0, 22, SCREEN_W, tft.color565(40, 40, 50));
+  
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(tft.color565(186, 195, 210), TFT_BLACK);
+  tft.drawString("ESTADO DEL DISPOSITIVO", 160, 11, 2);
+
+  // Left Column - Network & Routine
+  tft.setTextDatum(ML_DATUM);
+  
+  tft.setTextColor(tft.color565(156, 163, 175), TFT_BLACK); // Slate Gray
+  tft.drawString("IP:", 20, 45, 2);
+  tft.setTextColor(tft.color565(12, 182, 196), TFT_BLACK); // Cyber Teal
+  tft.drawString(activeIp(), 20, 68, 2);
+  
+  tft.setTextColor(tft.color565(156, 163, 175), TFT_BLACK); // Slate Gray
+  tft.drawString("RUTINA:", 20, 98, 2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(routineName.substring(0, 18), 20, 121, 2);
+
+  // Right Column - Preferences & Progress
+  // Divider in the center
+  tft.drawFastVLine(160, 32, 106, tft.color565(40, 40, 50));
+
+  tft.setTextColor(tft.color565(156, 163, 175), TFT_BLACK);
+  tft.drawString("AVISOS:", 180, 45, 2);
+  
+  // Vibration status
+  tft.setTextColor(tft.color565(156, 163, 175), TFT_BLACK);
+  tft.drawString("Vibra:", 180, 68, 2);
+  if (deviceVibration) {
+    tft.setTextColor(tft.color565(16, 185, 129), TFT_BLACK); // Green
+    tft.drawString("SI", 240, 68, 2);
+  } else {
+    tft.setTextColor(tft.color565(239, 68, 68), TFT_BLACK); // Red
+    tft.drawString("NO", 240, 68, 2);
+  }
+  
+  // Sound status
+  tft.setTextColor(tft.color565(156, 163, 175), TFT_BLACK);
+  tft.drawString("Sonido:", 180, 88, 2);
+  if (deviceSound) {
+    tft.setTextColor(tft.color565(16, 185, 129), TFT_BLACK); // Green
+    tft.drawString("SI", 245, 88, 2);
+  } else {
+    tft.setTextColor(tft.color565(239, 68, 68), TFT_BLACK); // Red
+    tft.drawString("NO", 245, 88, 2);
+  }
+
+  // Completed tasks count
+  int completedCount = 0;
+  for (size_t i = 0; i < routineCount; i++) {
+    if (routine[i].completed) completedCount++;
+  }
+  
+  tft.setTextColor(tft.color565(156, 163, 175), TFT_BLACK);
+  tft.drawString("TAREAS:", 180, 115, 2);
+  tft.setTextColor(tft.color565(249, 115, 22), TFT_BLACK); // Premium Orange
+  String progressStr = String(completedCount) + " / " + String(routineCount);
+  tft.drawString(progressStr, 180, 135, 2);
+
+  // Footer
+  tft.setTextDatum(MC_DATUM);
+  tft.drawFastHLine(0, 148, SCREEN_W, tft.color565(40, 40, 50));
+  tft.setTextColor(tft.color565(100, 116, 139), TFT_BLACK);
+  tft.drawString("Cualquier boton para salir", 160, 159, 2);
+}
+
+static void drawIdleScreen(uint16_t minute) {
+  bool forceRedraw = (activeIndex != lastDrawnIndex || lastDrawnNeedsMenu);
+
+  if (forceRedraw) {
+    tft.fillScreen(TFT_BLACK);
+    drawHeader(minute);
+  } else if (minute != lastDrawnMinute || activeIp() != lastDrawnIp || batteryPercent() != lastDrawnBattery) {
+    drawHeader(minute);
+  }
+
+  if (forceRedraw || minute != lastDrawnMinute) {
+    // Large digital clock in the center using Font 7 (48px digital numbers)
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(tft.color565(12, 182, 196), TFT_BLACK); // Premium Cyber Teal
+    tft.drawString(minutesToTime(minute), 160, 75, 7);
+
+    // "Esperando rutina" in Font 2 in elegant slate gray
+    tft.setTextColor(tft.color565(156, 163, 175), TFT_BLACK);
+    tft.drawString("Esperando rutina", 160, 125, 2);
+
+    if (!wifiConnected) {
+      tft.setTextColor(tft.color565(100, 116, 139), TFT_BLACK);
+      tft.drawString(wifiStatusName(lastWifiStatus), 160, 148, 2);
+    } else {
+      // Clear the wifi status area if connected
+      tft.fillRect(40, 138, 240, 20, TFT_BLACK);
+    }
+  }
+
+  lastDrawnIndex = activeIndex;
+  lastDrawnMinute = minute;
+  lastDrawnIp = activeIp();
+  lastDrawnBattery = batteryPercent();
+}
+
+static void drawScreen(bool force) {
+  if (!previewMode && !force && millis() - lastDrawAt < DISPLAY_REFRESH_MS) return;
+  lastDrawAt = millis();
+
+  if (force) {
+    lastDrawnIndex = -2;
+    lastDrawnNeedsMenu = false;
+    lastDrawnMinute = 9999;
+    lastDrawnCompleted = false;
+    lastDrawnProgress = 255;
+    lastDrawnIp = "";
+  }
+
+  if (infoMode) {
+    if (millis() - infoStartedAt >= 300000) { // 5 minutes auto-dismiss
+      infoMode = false;
+      disableNetwork();
+      drawScreen(true);
+      return;
+    }
+
+    uint16_t minute = currentMinuteOfDay();
+    if (lastDrawnIndex != -4) {
+      drawInfoScreen(minute);
+      lastDrawnIndex = -4;
+    } else {
+      if (minute != lastDrawnMinute || activeIp() != lastDrawnIp || batteryPercent() != lastDrawnBattery) {
+        drawInfoScreen(minute);
+        lastDrawnMinute = minute;
+        lastDrawnIp = activeIp();
+        lastDrawnBattery = batteryPercent();
+      }
+    }
+    return;
+  }
+
+  if (previewMode) {
+    if (millis() - previewStartedAt >= 3000) {
+      previewMode = false;
+      drawScreen(true);
+      return;
+    }
+
+    if (lastDrawnIndex != -3) {
+      tft.fillScreen(TFT_BLACK);
+      uint16_t minute = currentMinuteOfDay();
+      drawHeader(minute);
+
+      if (previewIndex >= 0 && (size_t)previewIndex < routineCount) {
+        const RoutineItem &nextItem = routine[previewIndex];
+        
+        // Draw pictogram on the left
+        int picX = 30;
+        int picY = 50;
+        int picW = 80;
+        int picH = 80;
+        if (!drawPictogramImage(nextItem, picX, picY, picW, picH)) {
+          drawPictogramPlaceholder(nextItem, picX, picY, picW, picH);
+        }
+
+        // Text on the right
+        int textX = 205;
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(tft.color565(156, 163, 175), TFT_BLACK); // Slate gray
+        tft.drawString("SIGUIENTE TAREA", textX, 50, 2);
+
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        // In preview, we just show one line or cut it if it's too long, or we could split it.
+        // For simplicity, just use font 4 and center it.
+        tft.drawString(nextItem.title, textX, 85, 4);
+
+        String timeRange = minutesToTime(nextItem.startMin) + " - " + minutesToTime(nextItem.endMin);
+        tft.setTextColor(tft.color565(16, 185, 129), TFT_BLACK); // Emerald green
+        tft.drawString(timeRange, textX, 125, 4);
+      } else {
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.drawString("Fin de la rutina", 160, 85, 4);
+        tft.setTextColor(tft.color565(156, 163, 175), TFT_BLACK);
+        tft.drawString("No hay mas tareas hoy", 160, 120, 2);
+      }
+      lastDrawnIndex = -3;
+    } else {
+      uint16_t minute = currentMinuteOfDay();
+      if (minute != lastDrawnMinute || activeIp() != lastDrawnIp || batteryPercent() != lastDrawnBattery) {
+        drawHeader(minute);
+        lastDrawnMinute = minute;
+        lastDrawnIp = activeIp();
+        lastDrawnBattery = batteryPercent();
+      }
+    }
+    return;
+  }
+
+  uint16_t minute = currentMinuteOfDay();
+  int nextActive = findActiveRoutineIndex(minute);
+  if (nextActive != activeIndex) {
+    activeIndex = nextActive;
+    if (activeIndex >= 0 && !routine[activeIndex].completed) startTransitionAlert();
+  }
+
+  if (activeIndex >= 0) {
+    drawActiveScreen(minute);
+  } else {
+    drawIdleScreen(minute);
+  }
+}
+
+static void handleButtons() {
+  bool okDown = digitalRead(PIN_BUTTON_OK) == LOW;
+  bool menuDown = digitalRead(PIN_BUTTON_MENU) == LOW;
+  uint32_t now = millis();
+
+  // Detect both buttons held for 5 seconds to power off
+  static uint32_t bothPressedAt = 0;
+  static bool bothWereDown = false;
+
+  if (okDown && menuDown) {
+    if (!bothWereDown) {
+      bothPressedAt = now;
+      bothWereDown = true;
+    } else if (now - bothPressedAt >= 5000) {
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setTextDatum(MC_DATUM);
+      tft.drawString("Apagando...", 160, 85, 4);
+      delay(1000);
+      
+      digitalWrite(PIN_LCD_BACKLIGHT, LOW);
+      tft.writecommand(0x10); // ST7789_SLPIN
+      
+      esp_sleep_enable_ext1_wakeup((1ULL << PIN_BUTTON_OK) | (1ULL << PIN_BUTTON_MENU), ESP_EXT1_WAKEUP_ANY_LOW);
+      esp_deep_sleep_start();
+    }
+    // Prevent individual button actions from triggering repeatedly while both are held
+    okWasDown = okDown;
+    menuWasDown = menuDown;
+    return;
+  } else {
+    bothWereDown = false;
+  }
+
+  bool anyButtonPressed = (okDown && !okWasDown) || (menuDown && !menuWasDown);
+  if (anyButtonPressed) {
+    lastInteractionTime = now;
+    if (screenIsAsleep) {
+      screenIsAsleep = false;
+      tft.writecommand(0x11); // ST7789_SLPOUT
+      delay(120);
+      digitalWrite(PIN_LCD_BACKLIGHT, HIGH);
+      drawScreen(true);
+      okWasDown = okDown;
+      menuWasDown = menuDown;
+      if (okDown) okPressedAt = now;
+      if (menuDown) menuPressedAt = now;
+      return;
+    }
+  }
+
+  // Handle OK button
+  if (okDown && !okWasDown) {
+    okPressedAt = now;
+    if (infoMode) {
+      infoMode = false;
+      disableNetwork();
+      drawScreen(true);
+    } else if (previewMode) {
+      previewMode = false;
+      drawScreen(true);
+    } else if (activeIndex >= 0) {
+      if (!routine[activeIndex].completed) {
+        routine[activeIndex].completed = true;
+        
+        if (deviceSound) {
+          // Sonido de "Logro" (Arpegio ascendente alegre)
+          buzz(523, 80); // Do
+          delay(20);
+          buzz(659, 80); // Mi
+          delay(20);
+          buzz(784, 80); // Sol
+          delay(20);
+          buzz(1046, 200); // Do agudo
+        }
+        
+        drawScreen(true);
+      }
+    }
+  }
+
+  // Handle MENU button
+  if (menuDown && !menuWasDown) {
+    menuPressedAt = now;
+    menuLongPressed = false;
+    
+    // Only trigger preview if we are NOT in infoMode
+    if (infoMode) {
+      infoMode = false;
+      disableNetwork();
+      drawScreen(true);
+    } else {
+      previewMode = true;
+      previewStartedAt = now;
+      previewIndex = findNextRoutineIndex(currentMinuteOfDay());
+      drawScreen(true);
+    }
+  }
+
+  // Detect long press on MENU (3 seconds) to trigger Info Mode
+  if (menuDown && !infoMode && !menuLongPressed) {
+    if (now - menuPressedAt >= 3000) {
+      menuLongPressed = true;
+      previewMode = false; // Cancel preview mode
+      infoMode = true;
+      infoStartedAt = now;
+      enableNetwork();
+      drawScreen(true);
+      
+      // Feedback buzz to let user know it was triggered
+      buzz(1000, 100);
+    }
+  }
+
+  okWasDown = okDown;
+  menuWasDown = menuDown;
+}
+
+static String contentTypeFor(const String &filename) {
+  if (filename.endsWith(".html")) return "text/html";
+  if (filename.endsWith(".css")) return "text/css";
+  if (filename.endsWith(".js")) return "application/javascript";
+  if (filename.endsWith(".json")) return "application/json";
+  if (filename.endsWith(".png")) return "image/png";
+  if (filename.endsWith(".jpg") || filename.endsWith(".jpeg")) return "image/jpeg";
+  return "application/octet-stream";
+}
+
+static void setupWebServer() {
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  server.onNotFound([](AsyncWebServerRequest *request) {
+    if (request->method() == HTTP_OPTIONS) {
+      request->send(204);
+      return;
+    }
+    request->send(404, "text/plain", "No encontrado");
+  });
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(LittleFS, "/index.html", "text/html");
+  });
+
+  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    doc["name"] = DEVICE_NAME;
+    doc["mode"] = wifiModeName();
+    doc["battery"] = batteryPercent();
+    doc["ip"] = activeIp();
+    doc["mdns"] = String("http://") + DEVICE_NAME + ".local";
+    doc["ssid"] = wifiConnected ? WiFi.SSID() : "";
+    doc["attemptedSsid"] = attemptedWifiSsid;
+    doc["wifiStatus"] = wifiStatusName(lastWifiStatus);
+    doc["wifiStatusCode"] = static_cast<int>(lastWifiStatus);
+    doc["rssi"] = wifiConnected ? WiFi.RSSI() : 0;
+    doc["routineItems"] = routineCount;
+    doc["active"] = activeIndex >= 0 ? routine[activeIndex].title : "";
+    String body;
+    serializeJson(doc, body);
+    request->send(200, "application/json", body);
+  });
+
+  server.on("/api/wifi/scan", HTTP_GET, [](AsyncWebServerRequest *request) {
+    int count = WiFi.scanNetworks(false, true);
+    JsonDocument doc;
+    JsonArray networks = doc["networks"].to<JsonArray>();
+    for (int i = 0; i < count; i++) {
+      JsonObject network = networks.add<JsonObject>();
+      network["ssid"] = WiFi.SSID(i);
+      network["rssi"] = WiFi.RSSI(i);
+      network["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+    }
+    String body;
+    serializeJson(doc, body);
+    request->send(200, "application/json", body);
+  });
+
+  server.on("/api/wifi/save", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("ssid", true)) {
+      request->send(400, "text/plain", "Falta SSID");
+      return;
+    }
+    String ssid = request->getParam("ssid", true)->value();
+    String password = request->hasParam("password", true)
+                          ? request->getParam("password", true)->value()
+                          : "";
+    ssid.trim();
+    if (ssid.isEmpty()) {
+      request->send(400, "text/plain", "SSID vacio");
+      return;
+    }
+
+    prefs.begin("wifi", false);
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", password);
+    prefs.end();
+    request->send(200, "text/plain", "Wi-Fi guardada. Reiniciando...");
+    restartPending = true;
+    restartAt = millis() + 700;
+  });
+
+  server.on("/api/wifi/forget", HTTP_POST, [](AsyncWebServerRequest *request) {
+    prefs.begin("wifi", false);
+    prefs.clear();
+    prefs.end();
+    request->send(200, "text/plain", "Wi-Fi olvidada. Reiniciando...");
+    restartPending = true;
+    restartAt = millis() + 700;
+  });
+
+  server.on("/api/routine", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(LittleFS, ROUTINE_PATH, "application/json");
+  });
+
+  server.on("/api/time", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!rtcAvailable || !request->hasParam("epoch", true)) {
+      request->send(400, "text/plain", "RTC no disponible o fecha no recibida");
+      return;
+    }
+    time_t utc_epoch = request->getParam("epoch", true)->value().toInt();
+    struct tm tm_local;
+    localtime_r(&utc_epoch, &tm_local);
+    DateTime local_dt(tm_local.tm_year + 1900, tm_local.tm_mon + 1, tm_local.tm_mday, tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec);
+    rtc.adjust(local_dt);
+    drawScreen(true);
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on(
+      "/upload", HTTP_POST,
+      [](AsyncWebServerRequest *request) {
+        loadRoutine();
+        drawScreen(true);
+        request->send(200, "text/plain", "OK");
+      },
+      [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data,
+         size_t len, bool final) {
+        String path = filename == "rutina.json" ? ROUTINE_PATH : "/pictos/" + filename;
+        if (!index) {
+          if (path.startsWith("/pictos/") && !LittleFS.exists("/pictos")) LittleFS.mkdir("/pictos");
+          request->_tempFile = LittleFS.open(path, "w");
+        }
+        if (request->_tempFile) request->_tempFile.write(data, len);
+        if (final && request->_tempFile) request->_tempFile.close();
+      });
+
+  server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
+  server.begin();
+}
+
+static bool connectSavedWifi() {
+  prefs.begin("wifi", true);
+  String ssid = prefs.getString("ssid", "");
+  String password = prefs.getString("pass", "");
+  prefs.end();
+
+  if (FORCE_DEFAULT_WIFI || ssid.isEmpty()) {
+    ssid = DEFAULT_WIFI_SSID;
+    password = DEFAULT_WIFI_PASSWORD;
+  }
+
+  if (ssid.isEmpty() || password == "CAMBIA_ESTA_CLAVE") return false;
+
+  attemptedWifiSsid = ssid;
+  Serial.printf("Intentando Wi-Fi SSID: %s\n", ssid.c_str());
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(DEVICE_NAME);
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  uint32_t startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_CONNECT_TIMEOUT_MS) {
+    lastWifiStatus = WiFi.status();
+    delay(250);
+  }
+
+  lastWifiStatus = WiFi.status();
+  wifiConnected = WiFi.status() == WL_CONNECTED;
+  Serial.printf("Resultado Wi-Fi: %s (%d), IP: %s\n",
+                wifiStatusName(lastWifiStatus).c_str(),
+                static_cast<int>(lastWifiStatus),
+                WiFi.localIP().toString().c_str());
+  return wifiConnected;
+}
+
+static void startSetupAp() {
+  setupMode = true;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+}
+
+static void setupWifi() {
+  wifiConnected = connectSavedWifi();
+  if (!wifiConnected) startSetupAp();
+  if (MDNS.begin(DEVICE_NAME)) {
+    MDNS.addService("http", "tcp", 80);
+  }
+}
+
+static String buildStatusJson() {
+  JsonDocument doc;
+  doc["name"] = DEVICE_NAME;
+  doc["mode"] = wifiModeName();
+  doc["ip"] = activeIp();
+  doc["mdns"] = String("http://") + DEVICE_NAME + ".local";
+  doc["ssid"] = wifiConnected ? WiFi.SSID() : "";
+  doc["attemptedSsid"] = attemptedWifiSsid;
+  doc["wifiStatus"] = wifiStatusName(lastWifiStatus);
+  doc["battery"] = batteryPercent();
+  String body;
+  serializeJson(doc, body);
+  return body;
+}
+
+static void updateBleStatus() {
+  if (!bleStatus) return;
+  String body = buildStatusJson();
+  bleStatus->setValue(reinterpret_cast<const uint8_t *>(body.c_str()), body.length());
+  bleStatus->notify();
+}
+
+class WifiProvisionCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *characteristic) override {
+    std::string raw = characteristic->getValue();
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, raw.c_str());
+    if (err) return;
+
+    String ssid = doc["ssid"] | "";
+    String password = doc["password"] | "";
+    ssid.trim();
+    if (ssid.isEmpty()) return;
+
+    prefs.begin("wifi", false);
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", password);
+    prefs.end();
+
+    updateBleStatus();
+    restartPending = true;
+    restartAt = millis() + 900;
+  }
+};
+
+
+
+class MyServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer) override {
+    bleConnected = true;
+    drawScreen(true); // Forzar redibujado instantáneo del HUD
+  }
+  void onDisconnect(NimBLEServer* pServer) override {
+    bleConnected = false;
+    drawScreen(true); // Forzar redibujado instantáneo del HUD
+  }
+};
+
+static MyServerCallbacks myServerCallbacks;
+static WifiProvisionCallbacks wifiProvisionCallbacks;
+
+static bool bleInitialized = false;
+
+static void setupBleProvisioning() {
+  if (bleInitialized) {
+    if (!NimBLEDevice::getAdvertising()->isAdvertising()) {
+      NimBLEDevice::getAdvertising()->start();
+    }
+    return;
+  }
+  bleInitialized = true;
+  NimBLEDevice::init("BuscaTEA");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+  NimBLEServer *bleServer = NimBLEDevice::createServer();
+  bleServer->setCallbacks(&myServerCallbacks);
+  NimBLEService *service = bleServer->createService(BLE_SERVICE_UUID);
+
+  bleStatus = service->createCharacteristic(
+      BLE_STATUS_UUID,
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  String initialStatus = buildStatusJson();
+  bleStatus->setValue(
+      reinterpret_cast<const uint8_t *>(initialStatus.c_str()),
+      initialStatus.length());
+
+  NimBLECharacteristic *wifiConfig = service->createCharacteristic(
+      BLE_WIFI_UUID,
+      NIMBLE_PROPERTY::WRITE);
+  wifiConfig->setCallbacks(&wifiProvisionCallbacks);
+
+  service->start();
+
+  NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
+  advertising->addServiceUUID(BLE_SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->start();
+}
+
+static bool networkActive = false;
+static bool webServerInitialized = false;
+
+static void enableNetwork() {
+  if (networkActive) return;
+  networkActive = true;
+  setupWifi();
+  if (!webServerInitialized) {
+    setupWebServer(); // Web server routes are added only once
+    webServerInitialized = true;
+  }
+  setupBleProvisioning();
+}
+
+static void disableNetwork() {
+  if (!networkActive) return;
+  networkActive = false;
+  WiFi.mode(WIFI_OFF);
+  if (bleInitialized && NimBLEDevice::getAdvertising()->isAdvertising()) {
+    NimBLEDevice::getAdvertising()->stop();
+  }
+}
+
+static void setupTime() {
+  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+  tzset();
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  rtcAvailable = rtc.begin();
+  if (rtcAvailable && rtc.lostPower()) {
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Check if waking up from deep sleep (software power off)
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
+    pinMode(PIN_BUTTON_OK, INPUT_PULLUP);
+    pinMode(PIN_BUTTON_MENU, INPUT_PULLUP);
+    
+    // Wait a brief moment to ensure BOTH buttons are pressed
+    uint32_t checkStart = millis();
+    bool bothInitiallyPressed = false;
+    while(millis() - checkStart < 200) {
+      if (digitalRead(PIN_BUTTON_OK) == LOW && digitalRead(PIN_BUTTON_MENU) == LOW) {
+        bothInitiallyPressed = true;
+        break;
+      }
+      delay(10);
+    }
+    
+    if (!bothInitiallyPressed) {
+      // Only one button was pressed (accidental wake), go back to sleep silently
+      esp_sleep_enable_ext1_wakeup((1ULL << PIN_BUTTON_OK) | (1ULL << PIN_BUTTON_MENU), ESP_EXT1_WAKEUP_ANY_LOW);
+      esp_deep_sleep_start();
+    }
+    
+    // Both pressed, give visual feedback
+    pinMode(PIN_POWER_ON, OUTPUT);
+    digitalWrite(PIN_POWER_ON, HIGH);
+    pinMode(PIN_LCD_BACKLIGHT, OUTPUT);
+    digitalWrite(PIN_LCD_BACKLIGHT, HIGH);
+    
+    tft.init();
+    tft.setRotation(1);
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("Mantenga pulsado...", 160, 85, 4);
+
+    bool keepAlive = false;
+    uint32_t startWake = millis();
+    while (millis() - startWake < 4800) { // Total 5s hold
+      if (digitalRead(PIN_BUTTON_OK) != LOW || digitalRead(PIN_BUTTON_MENU) != LOW) {
+        keepAlive = false;
+        break;
+      }
+      keepAlive = true;
+      delay(50);
+    }
+
+    if (!keepAlive) {
+      // Released too early, abort boot and go back to sleep
+      digitalWrite(PIN_LCD_BACKLIGHT, LOW);
+      tft.writecommand(0x10); // ST7789_SLPIN
+      esp_sleep_enable_ext1_wakeup((1ULL << PIN_BUTTON_OK) | (1ULL << PIN_BUTTON_MENU), ESP_EXT1_WAKEUP_ANY_LOW);
+      esp_deep_sleep_start();
+    }
+    
+    // Successfully held, show starting message
+    tft.fillScreen(TFT_BLACK);
+    tft.drawString("Encendiendo...", 160, 85, 4);
+    delay(1000);
+  }
+
+  pinMode(PIN_VIBRATION, OUTPUT);
+  pinMode(PIN_POWER_ON, OUTPUT);
+  pinMode(PIN_LCD_BACKLIGHT, OUTPUT);
+  pinMode(PIN_BUTTON_OK, INPUT_PULLUP);
+  pinMode(PIN_BUTTON_MENU, INPUT_PULLUP);
+  digitalWrite(PIN_POWER_ON, HIGH);
+  digitalWrite(PIN_LCD_BACKLIGHT, HIGH);
+  digitalWrite(PIN_VIBRATION, LOW);
+  analogReadResolution(12);
+
+  ledcSetup(0, 2000, 8);
+  ledcAttachPin(PIN_BUZZER, 0);
+
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  TJpgDec.setJpgScale(1);
+  TJpgDec.setSwapBytes(true);
+  TJpgDec.setCallback(tftJpegOutput);
+
+  if (!LittleFS.begin(true)) {
+    tft.drawString("Error LittleFS", 160, 85, 2);
+    return;
+  }
+
+  if (LittleFS.exists("/logo.jpg")) {
+    TJpgDec.setJpgScale(1);
+    TJpgDec.drawFsJpg(0, 0, "/logo.jpg", LittleFS);
+    delay(2500); // 2.5s splash delay
+  }
+
+  setupTime();
+  loadRoutine();
+  
+  WiFi.mode(WIFI_OFF); // Ensure radio is off on boot
+  
+  lastInteractionTime = millis();
+  drawScreen(true);
+}
+
+void loop() {
+  handleButtons();
+  updateAlert();
+  
+  if (!screenIsAsleep) {
+    drawScreen();
+    
+    if (!infoMode && !previewMode) {
+      uint32_t timeoutMs = (activeIndex >= 0) ? 180000 : 60000;
+      if (millis() - lastInteractionTime > timeoutMs) {
+        screenIsAsleep = true;
+        digitalWrite(PIN_LCD_BACKLIGHT, LOW);
+        tft.writecommand(0x10); // ST7789_SLPIN
+      }
+    }
+  }
+  if (restartPending && millis() >= restartAt) {
+    ESP.restart();
+  }
+  static uint32_t lastBleUpdate = 0;
+  if (millis() - lastBleUpdate > 5000) {
+    lastBleUpdate = millis();
+    updateBleStatus();
+  }
+}
