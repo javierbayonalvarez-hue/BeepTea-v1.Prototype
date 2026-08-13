@@ -1,53 +1,55 @@
+🌍 *[Read this in English](README.md) | [Leer en Español](README_ES.md)*
+
 # BeepTEA
 
 ![BeepTEA Logo](firmware/data/logo.jpg)
 
-**BeepTEA** es un comunicador inteligente en formato reloj (basado en la placa LilyGo T-Display-S3) diseñado específicamente para ayudar a niños y personas con Trastorno del Espectro Autista (TEA) u otras necesidades cognitivas. 
+**BeepTEA** is a smartwatch-style smart communicator (based on the LilyGo T-Display-S3 board) specifically designed to help children and individuals with Autism Spectrum Disorder (ASD) or other cognitive needs.
 
-Su función principal es ofrecer rutinas visuales mediante pictogramas y un sistema de avisos por vibración sin necesidad de depender de una conexión constante a internet, mejorando su autonomía y reduciendo la ansiedad.
+Its main function is to provide visual routines using pictograms and a vibration alert system without relying on a constant internet connection, thereby improving autonomy and reducing anxiety.
 
 ---
 
-## 🎯 Características Principales
-* 📵 **Independencia Real:** Funciona 100% offline tras su configuración. Mantiene la hora internamente (RTC).
-* 🖼️ **Rutinas Visuales:** Muestra pictogramas personalizados para guiar al usuario en sus tareas del día a día (comer, lavarse las manos, dormir...).
-* 📳 **Alertas Amigables:** El reloj vibra y emite suaves tonos cuando llega la hora de una rutina nueva, captando la atención sin asustar.
-* 📶 **Conectividad a Demanda:** El propio reloj genera un portal cautivo (Red Wi-Fi directa) para configurarlo inicialmente o se conecta vía **Bluetooth (BLE)** para sincronizar rutinas con la App móvil.
+## 🎯 Main Features
+* 📵 **True Independence:** Works 100% offline after initial setup. Keeps time internally via RTC.
+* 🖼️ **Visual Routines:** Displays custom pictograms to guide the user through their daily tasks (eating, washing hands, sleeping...).
+* 📳 **Friendly Alerts:** The watch vibrates and emits gentle tones when it's time for a new routine, catching attention without causing distress.
+* 📶 **On-Demand Connectivity:** The watch hosts its own captive portal (Direct Wi-Fi) for initial setup, and connects via **Bluetooth (BLE)** to sync routines with the mobile App.
 
-## 📦 Estructura del Proyecto
+## 📦 Project Structure
 
-Este repositorio contiene todo lo necesario para montar y modificar el sistema al completo:
+This repository contains everything needed to build and modify the entire system:
 
-1. `/firmware`: El código fuente C++ para el microcontrolador ESP32-S3. Preparado para compilarse con **PlatformIO**.
-2. `/mobile-app`: El código fuente de la aplicación móvil compañera (**BeepTEA Manager**) desarrollada con **Capacitor** y HTML/JS puro. Permite subir pictogramas y programar las alarmas/rutinas de forma sencilla por Bluetooth.
-3. `/BOM.txt`: Lista de materiales y componentes utilizados en el proyecto.
+1. `/firmware`: The C++ source code for the ESP32-S3 microcontroller. Ready to be compiled with **PlatformIO**.
+2. `/mobile-app`: The source code for the companion mobile application (**BeepTEA Manager**) built with **Capacitor** and vanilla HTML/JS. Allows easy pictogram uploads and routine scheduling via Bluetooth.
+3. `/BOM.txt`: Bill of Materials and components used in the project.
 
-## 🛠️ Hardware Necesario
+## 🛠️ Hardware Requirements
 
-El cerebro del proyecto es una **LilyGo T-Display-S3**, un potentísimo ESP32-S3 con pantalla IPS a color incorporada. A esta placa le hemos añadido:
+The brain of the project is a **LilyGo T-Display-S3**, a powerful ESP32-S3 with a built-in color IPS display. We added the following to this board:
 
-* **Motor de Vibración (Háptico):** Conectado al PIN 43.
-* **Buzzer (Zumbador):** Conectado al PIN 44.
-* **Botón Físico Extra:** (Aparte de los botones internos en los PINES 0 y 14 de la placa).
-* **Batería LiPo:** Con monitorización inteligente de voltaje (se conecta al PIN 4 para medir batería).
+* **Vibration Motor (Haptic):** Connected to PIN 43.
+* **Buzzer:** Connected to PIN 44.
+* **Extra Physical Button:** (In addition to the internal buttons on PIN 0 and 14).
+* **LiPo Battery:** With smart voltage monitoring (connected to PIN 4).
 
-## 🚀 Guía de Instalación (Firmware)
+## 🚀 Installation Guide (Firmware)
 
-1. Instala [Visual Studio Code](https://code.visualstudio.com/) y la extensión [PlatformIO](https://platformio.org/).
-2. Abre la carpeta `/firmware` en VS Code.
-3. Conecta tu placa LilyGo T-Display-S3 por USB.
-4. Primero, compila y sube el sistema de archivos (LittleFS) usando la opción **`Upload File System Image`** en PlatformIO (esto subirá el portal cautivo y el logo).
-5. Segundo, compila y sube el código fuente con la opción **`Upload`**.
+1. Install [Visual Studio Code](https://code.visualstudio.com/) and the [PlatformIO](https://platformio.org/) extension.
+2. Open the `/firmware` folder in VS Code.
+3. Connect your LilyGo T-Display-S3 board via USB.
+4. First, compile and upload the filesystem (LittleFS) using the **`Upload File System Image`** option in PlatformIO (this uploads the captive portal and the logo).
+5. Second, compile and upload the source code using the **`Upload`** option.
 
-## 📱 Guía de Compilación (App Móvil)
+## 📱 Build Guide (Mobile App)
 
-Para compilar la aplicación móvil, necesitarás [Node.js](https://nodejs.org/) y Android Studio.
+To compile the mobile app, you will need [Node.js](https://nodejs.org/) and Android Studio.
 
-1. Abre la carpeta `/mobile-app` en tu terminal.
-2. Instala las dependencias: `npm install`
-3. Sincroniza el código web con el proyecto nativo de Android: `npx cap sync android`
-4. Ábrelo en Android Studio para generar tu APK: `npx cap open android`
+1. Open the `/mobile-app` folder in your terminal.
+2. Install dependencies: `npm install`
+3. Sync the web code with the native Android project: `npx cap sync android`
+4. Open it in Android Studio to build your APK: `npx cap open android`
 
-## 🤝 Créditos y Colaboración
+## 🤝 Credits and Collaboration
 
-Proyecto creado por Javier Bayón con dedicación para facilitar la vida y mejorar la autonomía de personas con TEA. ¡Siéntete libre de clonar, mejorar o proponer nuevas funcionalidades abriendo una *Pull Request*!
+A project created with dedication to make life easier and foster autonomy for people with ASD. Feel free to fork, improve, or propose new features by opening a *Pull Request*!
